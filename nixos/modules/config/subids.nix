@@ -46,6 +46,24 @@ let
 in
 {
   options.users.subIdRanges = {
+    static = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether to generate the {file}`/etc/subuid` and {file}`/etc/subgid`
+        files at build time and store them directly in the system closure,
+        without requiring any services at boot time.
+
+        This is strictly intended for configurations with a static set of
+        users and is particularly useful for systems with an immutable
+        {file}`/etc`, as it avoids the need for runtime writes.
+
+        WARNING: In this mode, deleting or inserting users in your
+        configuration might cause subordinate ID ranges to shift, which
+        could break existing files in unprivileged containers.
+      '';
+    };
+
     strictOverlapCheck = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -64,63 +82,85 @@ in
     };
   };
 
-  config = lib.mkIf (!usePerl) {
-    # One-shot seed of /etc/sub{u,g}id from update-users-groups.pl's
-    # auto-subuid-map so that nixos-subids preserves existing allocations on
-    # the first run after switching away from the perl script.
-    # Can be removed once the perl script is no longer used.
-    systemd.services.nixos-subids-import-legacy = {
-      wantedBy = [ "sysinit.target" ];
-      requiredBy = [ "nixos-subids.service" ];
-      before = [
-        "nixos-subids.service"
-        "shutdown.target"
-      ];
-      after = [ "systemd-remount-fs.service" ];
-      conflicts = [ "shutdown.target" ];
-      unitConfig = {
-        Description = "Seed /etc/sub{u,g}id from legacy auto-subuid-map";
-        DefaultDependencies = false;
-        ConditionPathExists = [
-          "/var/lib/nixos/auto-subuid-map"
-          "!/var/lib/nixos-subids/.legacy-imported"
+  config = lib.mkIf (!usePerl) (lib.mkMerge [
+    {
+      # One-shot seed of /etc/sub{u,g}id from update-users-groups.pl's
+      # auto-subuid-map so that nixos-subids preserves existing allocations on
+      # the first run after switching away from the perl script.
+      # Can be removed once the perl script is no longer used.
+      systemd.services.nixos-subids-import-legacy = lib.mkIf (!cfg.static) {
+        wantedBy = [ "sysinit.target" ];
+        requiredBy = [ "nixos-subids.service" ];
+        before = [
+          "nixos-subids.service"
+          "shutdown.target"
         ];
+        after = [ "systemd-remount-fs.service" ];
+        conflicts = [ "shutdown.target" ];
+        unitConfig = {
+          Description = "Seed /etc/sub{u,g}id from legacy auto-subuid-map";
+          DefaultDependencies = false;
+          ConditionPathExists = [
+            "/var/lib/nixos/auto-subuid-map"
+            "!/var/lib/nixos-subids/.legacy-imported"
+          ];
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          StateDirectory = "nixos-subids";
+          ExecStart = "${importLegacyScript} /etc";
+        };
       };
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        StateDirectory = "nixos-subids";
-        ExecStart = "${importLegacyScript} /etc";
-      };
-    };
 
-    systemd.services.nixos-subids = {
-      wantedBy = [ "sysinit.target" ];
-      requiredBy = [ "sysinit-reactivation.target" ];
-      after = [
-        "systemd-remount-fs.service"
-        "nixos-subids-import-legacy.service"
-        # Run after user creation so /etc/passwd is fully populated, matching
-        # the existing update-users-groups.pl behaviour.
-        "userborn.service"
-        "systemd-sysusers.service"
-      ];
-      before = [
-        "sysinit.target"
-        "sysinit-reactivation.target"
-        "shutdown.target"
-      ];
-      conflicts = [ "shutdown.target" ];
-      restartTriggers = [ subidsJson ];
-      unitConfig = {
-        Description = "Manage /etc/subuid and /etc/subgid";
-        DefaultDependencies = false;
+      systemd.services.nixos-subids = lib.mkIf (!cfg.static) {
+        wantedBy = [ "sysinit.target" ];
+        requiredBy = [ "sysinit-reactivation.target" ];
+        after = [
+          "systemd-remount-fs.service"
+          "nixos-subids-import-legacy.service"
+          # Run after user creation so /etc/passwd is fully populated, matching
+          # the existing update-users-groups.pl behaviour.
+          "userborn.service"
+          "systemd-sysusers.service"
+        ];
+        before = [
+          "sysinit.target"
+          "sysinit-reactivation.target"
+          "shutdown.target"
+        ];
+        conflicts = [ "shutdown.target" ];
+        restartTriggers = [ subidsJson ];
+        unitConfig = {
+          Description = "Manage /etc/subuid and /etc/subgid";
+          DefaultDependencies = false;
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${lib.getExe pkgs.nixos-subids} ${lib.optionalString cfg.strictOverlapCheck "--strict "}${subidsJson} /etc";
+        };
       };
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        ExecStart = "${lib.getExe pkgs.nixos-subids} ${lib.optionalString cfg.strictOverlapCheck "--strict "}${subidsJson} /etc";
-      };
-    };
-  };
+    }
+
+    (lib.mkIf cfg.static {
+      environment.etc =
+        let
+          staticFiles = pkgs.runCommand "static-subids" { } ''
+            mkdir -p $out
+            ${lib.getExe pkgs.nixos-subids} ${lib.optionalString cfg.strictOverlapCheck "--strict "}${subidsJson} $out
+          '';
+        in
+        {
+          subuid = {
+            source = "${staticFiles}/subuid";
+            mode = "0644";
+          };
+          subgid = {
+            source = "${staticFiles}/subgid";
+            mode = "0644";
+          };
+        };
+    })
+  ]);
 }
